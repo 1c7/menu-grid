@@ -13,6 +13,7 @@ func textValue(_ element: AXUIElement, _ key: String) -> String {
 struct MenuEntry: Identifiable {
     let id: String
     let name: String
+    let pinKey: String
     let image: NSImage
     let element: AXUIElement
     let sourceElement: AXUIElement
@@ -24,7 +25,24 @@ final class MenuStore: ObservableObject {
     @Published var refreshing = false
     @Published var message = ""
     @Published var search = ""
-    var filtered: [MenuEntry] { search.isEmpty ? entries : entries.filter { $0.name.localizedCaseInsensitiveContains(search) } }
+    @Published private(set) var pinnedKeys = UserDefaults.standard.stringArray(forKey: "pinnedMenuItems.v1") ?? []
+    func isPinned(_ entry: MenuEntry) -> Bool { pinnedKeys.contains(entry.pinKey) }
+    func togglePin(_ entry: MenuEntry) {
+        if let index = pinnedKeys.firstIndex(of: entry.pinKey) { pinnedKeys.remove(at: index) }
+        else { pinnedKeys.append(entry.pinKey) }
+        UserDefaults.standard.set(pinnedKeys, forKey: "pinnedMenuItems.v1")
+        if AppDelegate.shared.panel?.isVisible == true { AppDelegate.shared.resizeToContent() }
+    }
+    var ordered: [MenuEntry] {
+        let rank = Dictionary(pinnedKeys.enumerated().map { ($0.element, $0.offset) }, uniquingKeysWith: min)
+        return entries.sorted {
+            let left = rank[$0.pinKey] ?? Int.max
+            let right = rank[$1.pinKey] ?? Int.max
+            if left != right { return left < right }
+            return $0.name.localizedStandardCompare($1.name) == .orderedAscending
+        }
+    }
+    var filtered: [MenuEntry] { search.isEmpty ? ordered : ordered.filter { $0.name.localizedCaseInsensitiveContains(search) } }
     func refresh() {
         trusted = AXIsProcessTrusted()
         guard trusted, !refreshing else { return }
@@ -77,7 +95,11 @@ final class MenuStore: ObservableObject {
                         label == name || (!desc.isEmpty && label == desc) || (elements.count == 1 && (label == appName || label.hasPrefix(appName + "\n") || label.hasPrefix(appName + " ")))
                     } }
                     let liveElement = candidates.count == 1 ? candidates[0].0 : element
-                    found.append(MenuEntry(id: "\(app.processIdentifier)-\(index)", name: name, image: image, element: liveElement, sourceElement: element, app: app))
+                    // AX identifiers survive process restarts and changing status text.
+                    // Items without identifiers use their app-local ordinal (never PID).
+                    let owner = app.bundleIdentifier ?? app.bundleURL?.path ?? appName
+                    let pinKey = owner + "|" + (identifier.isEmpty ? "item:\(index)" : "ax:" + identifier)
+                    found.append(MenuEntry(id: "\(app.processIdentifier)-\(index)", name: name, pinKey: pinKey, image: image, element: liveElement, sourceElement: element, app: app))
                 }
             }
             let result = found.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
@@ -159,6 +181,8 @@ enum PanelLayout {
 struct Tile: View {
     let entry: MenuEntry
     let action: () -> Void
+    let pinned: Bool
+    let togglePin: () -> Void
     @State private var hover = false
     var body: some View {
         Button(action: action) {
@@ -170,8 +194,16 @@ struct Tile: View {
             .padding(.vertical, 6)
             .background(hover ? Color.primary.opacity(0.09) : Color.clear, in: RoundedRectangle(cornerRadius: 10))
             .contentShape(Rectangle())
-        }.buttonStyle(.plain).help(entry.name).onHover { hover = $0 }
+        }.buttonStyle(.plain).help(entry.name + (pinned ? " · 已置顶，右键取消" : " · 右键置顶" )).onHover { hover = $0 }
+        .overlay(alignment: .topTrailing) {
+            if pinned { Image(systemName: "pin.fill").font(.system(size: 9)).foregroundStyle(Color.accentColor).padding(3).allowsHitTesting(false).accessibilityHidden(true) }
+        }
+        .contextMenu {
+            Button(pinned ? "取消置顶" : "置顶") { togglePin() }
+        }
         .accessibilityLabel(entry.name)
+        .accessibilityValue(pinned ? "已置顶" : "")
+        .accessibilityAction(named: Text(pinned ? "取消置顶" : "置顶")) { togglePin() }
     }
 }
 struct Panel: View {
@@ -200,7 +232,7 @@ struct Panel: View {
                 } else {
                     ScrollView {
                         LazyVGrid(columns: Array(repeating: GridItem(.fixed(PanelLayout.cellWidth), spacing: PanelLayout.gap), count: 10), alignment: .leading, spacing: 5) {
-                            ForEach(store.filtered) { entry in Tile(entry: entry) { store.open(entry) } }
+                            ForEach(store.filtered) { entry in Tile(entry: entry, action: { store.open(entry) }, pinned: store.isPinned(entry), togglePin: { store.togglePin(entry) }) }
                         }.padding(.vertical, 2)
                     }.frame(height: PanelLayout.gridHeight(store.filtered))
                 }
