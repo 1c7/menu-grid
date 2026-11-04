@@ -133,6 +133,29 @@ final class MenuStore: ObservableObject {
         }
     }
 }
+enum PanelLayout {
+    static let width: CGFloat = 696
+    static let columns = 10
+    static let cellWidth: CGFloat = 61
+    static let gap: CGFloat = 6
+    static func gridHeight(_ entries: [MenuEntry]) -> CGFloat {
+        let font = NSFont.systemFont(ofSize: 10)
+        var total: CGFloat = 0
+        for start in stride(from: 0, to: entries.count, by: columns) {
+            let row = entries[start..<min(start + columns, entries.count)]
+            let labelHeight = row.map { entry in
+                ceil((entry.name as NSString).boundingRect(with: NSSize(width: cellWidth, height: 1000), options: [.usesLineFragmentOrigin, .usesFontLeading], attributes: [.font: font]).height)
+            }.max() ?? 26
+            total += 27 + 7 + max(28, labelHeight) + 12 + 5
+        }
+        return min(440, max(75, total + 4))
+    }
+    static func contentHeight(_ store: MenuStore) -> CGFloat {
+        if !store.trusted { return 220 }
+        let body = store.filtered.isEmpty && !store.refreshing ? 70 : gridHeight(store.filtered)
+        return 24 + 26 + 10 + body + (store.message.isEmpty ? 0 : 38)
+    }
+}
 struct Tile: View {
     let entry: MenuEntry
     let action: () -> Void
@@ -141,9 +164,10 @@ struct Tile: View {
         Button(action: action) {
             VStack(spacing: 7) {
                 Image(nsImage: entry.image).resizable().scaledToFit().frame(width: 27, height: 27)
-                Text(entry.name).font(.system(size: 10)).lineLimit(1).truncationMode(.tail).foregroundStyle(.primary)
+                Text(entry.name).font(.system(size: 10)).multilineTextAlignment(.center).fixedSize(horizontal: false, vertical: true).frame(minHeight: 28, alignment: .top).foregroundStyle(.primary)
             }
-            .frame(width: 61, height: 66)
+            .frame(width: PanelLayout.cellWidth)
+            .padding(.vertical, 6)
             .background(hover ? Color.primary.opacity(0.09) : Color.clear, in: RoundedRectangle(cornerRadius: 10))
             .contentShape(Rectangle())
         }.buttonStyle(.plain).help(entry.name).onHover { hover = $0 }
@@ -153,19 +177,17 @@ struct Tile: View {
 struct Panel: View {
     @ObservedObject var store: MenuStore
     var body: some View {
-        VStack(spacing: 12) {
-            HStack {
-                Text("菜单栏").font(.system(size: 15, weight: .semibold))
-                Text("\(store.entries.count)").font(.system(size: 12)).foregroundStyle(.secondary)
-                Spacer()
+        VStack(spacing: 10) {
+            HStack(spacing: 12) {
+                TextField("搜索图标", text: $store.search).textFieldStyle(.roundedBorder)
+                    .accessibilityLabel("搜索图标")
                 if store.refreshing { ProgressView().controlSize(.small) }
-                Button { store.refresh() } label: { Image(systemName: "arrow.clockwise") }.buttonStyle(.plain).help("刷新")
-                Menu {
-                    Button("辅助功能权限") { AppDelegate.shared.permissions() }
+                Menu("设置") {
+                    Button("辅助功能权限…") { AppDelegate.shared.permissions() }
                     Divider()
                     Button("退出菜单栏面板") { NSApp.terminate(nil) }
-                } label: { Image(systemName: "ellipsis.circle") }.menuStyle(.borderlessButton).frame(width: 22)
-            }
+                }.menuStyle(.borderlessButton).fixedSize()
+            }.frame(height: 26)
             if !store.trusted {
                 VStack(spacing: 12) {
                     Text("允许辅助功能访问后，才能读取和打开菜单栏图标。")
@@ -173,20 +195,26 @@ struct Panel: View {
                     Button("已允许，重新读取") { store.refresh() }
                 }.frame(maxWidth: .infinity, minHeight: 130)
             } else {
-                TextField("搜索图标", text: $store.search).textFieldStyle(.roundedBorder)
                 if store.filtered.isEmpty && !store.refreshing {
-                    Text(store.search.isEmpty ? "没有读取到菜单栏图标，点刷新重试。" : "没有匹配的图标").foregroundStyle(.secondary).frame(height: 90)
+                    Text(store.search.isEmpty ? "没有读取到图标，重新打开面板可重试。" : "没有匹配的图标").foregroundStyle(.secondary).frame(height: 70)
                 } else {
                     ScrollView {
-                        LazyVGrid(columns: Array(repeating: GridItem(.fixed(61), spacing: 6), count: 10), alignment: .leading, spacing: 5) {
+                        LazyVGrid(columns: Array(repeating: GridItem(.fixed(PanelLayout.cellWidth), spacing: PanelLayout.gap), count: 10), alignment: .leading, spacing: 5) {
                             ForEach(store.filtered) { entry in Tile(entry: entry) { store.open(entry) } }
                         }.padding(.vertical, 2)
-                    }.frame(height: min(440, CGFloat(max(1, (store.filtered.count + 9) / 10)) * 71 + 4))
+                    }.frame(height: PanelLayout.gridHeight(store.filtered))
                 }
                 if !store.message.isEmpty { Text(store.message).font(.caption).foregroundStyle(.secondary) }
             }
-        }.padding(16).frame(width: 696)
+        }.padding(12).frame(width: PanelLayout.width, alignment: .topLeading)
+            .fixedSize(horizontal: false, vertical: true)
+            .onChange(of: store.search) { _ in AppDelegate.shared.resizeToContent() }
+            .onChange(of: store.message) { _ in AppDelegate.shared.resizeToContent() }
     }
+}
+final class GridPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
 }
 final class AppDelegate: NSObject, NSApplicationDelegate {
     static let shared = AppDelegate()
@@ -202,10 +230,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         item.button?.toolTip = "菜单栏面板 · 点击向下展开"
         item.button?.target = self
         item.button?.action = #selector(toggle)
-        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 696, height: 260), styleMask: [.titled, .fullSizeContentView, .nonactivatingPanel], backing: .buffered, defer: false)
+        panel = GridPanel(contentRect: NSRect(x: 0, y: 0, width: 696, height: 260), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.title = "菜单栏面板"
         panel.titleVisibility = .hidden
         panel.titlebarAppearsTransparent = true
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
         panel.standardWindowButton(.closeButton)?.isHidden = true
         panel.standardWindowButton(.miniaturizeButton)?.isHidden = true
         panel.standardWindowButton(.zoomButton)?.isHidden = true
@@ -215,6 +246,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.isReleasedWhenClosed = false
         let background = NSVisualEffectView()
         background.material = .popover
+        background.wantsLayer = true
+        background.layer?.cornerRadius = 18
+        background.layer?.masksToBounds = true
         background.state = .active
         background.blendingMode = .behindWindow
         panel.contentView = background
@@ -239,7 +273,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         store.refresh()
         guard let screen = item.button?.window?.screen ?? NSScreen.main else { return }
         let width: CGFloat = min(696, screen.visibleFrame.width - 24)
-        let height: CGFloat = store.trusted ? min(570, CGFloat(max(1, (store.entries.count + 9) / 10)) * 71 + 112) : 240
+        let height = min(screen.visibleFrame.height - 30, PanelLayout.contentHeight(store))
         var x = screen.visibleFrame.maxX - width - 12
         var top = screen.visibleFrame.maxY - 7
         if let button = item.button, let window = button.window, window.isVisible {
@@ -255,7 +289,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     func resizeToContent() {
         guard let screen = panel.screen else { return }
-        let height = min(screen.visibleFrame.height - 30, min(570, CGFloat(max(1, (store.filtered.count + 9) / 10)) * 71 + 112))
+        let height = min(screen.visibleFrame.height - 30, PanelLayout.contentHeight(store))
         var frame = panel.frame
         let top = frame.maxY
         frame.size.height = height
