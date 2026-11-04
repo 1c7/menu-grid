@@ -15,6 +15,7 @@ struct MenuEntry: Identifiable {
     let name: String
     let image: NSImage
     let element: AXUIElement
+    let sourceElement: AXUIElement
     let app: NSRunningApplication
 }
 final class MenuStore: ObservableObject {
@@ -76,7 +77,7 @@ final class MenuStore: ObservableObject {
                         label == name || (!desc.isEmpty && label == desc) || (elements.count == 1 && (label == appName || label.hasPrefix(appName + "\n") || label.hasPrefix(appName + " ")))
                     } }
                     let liveElement = candidates.count == 1 ? candidates[0].0 : element
-                    found.append(MenuEntry(id: "\(app.processIdentifier)-\(index)", name: name, image: image, element: liveElement, app: app))
+                    found.append(MenuEntry(id: "\(app.processIdentifier)-\(index)", name: name, image: image, element: liveElement, sourceElement: element, app: app))
                 }
             }
             let result = found.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
@@ -86,19 +87,48 @@ final class MenuStore: ObservableObject {
     func open(_ entry: MenuEntry) {
         message = ""
         AppDelegate.shared.hide()
-        // AXPress addresses the real status item, including items in system overflow.
-        // Never synthesize a coordinate click: overflow items have overlapping frames on macOS 27.
         DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.15) {
-            AXUIElementSetMessagingTimeout(entry.element, 1.5)
-            let result = AXUIElementPerformAction(entry.element, kAXPressAction as CFString)
-            if result != .success {
-                let fallback = AXUIElementPerformAction(entry.element, kAXShowMenuAction as CFString)
-                if fallback != .success {
-                    DispatchQueue.main.async {
-                        self.message = "\(entry.name) 暂不支持从面板打开（\(result.rawValue)）"
-                        AppDelegate.shared.show()
-                    }
+            func visibleMenu(_ element: AXUIElement, depth: Int = 0) -> Bool {
+                guard depth < 3 else { return false }
+                if textValue(element, kAXRoleAttribute) == kAXMenuRole,
+                   let raw = value(element, kAXSizeAttribute), CFGetTypeID(raw) == AXValueGetTypeID() {
+                    var size = CGSize.zero
+                    AXValueGetValue(raw as! AXValue, .cgSize, &size)
+                    if size.width > 0 && size.height > 0 { return true }
                 }
+                return (value(element, kAXChildrenAttribute) as? [AXUIElement] ?? []).contains { visibleMenu($0, depth: depth + 1) }
+            }
+            func windows() -> Set<Int> {
+                let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+                return Set(list.filter { ($0[kCGWindowOwnerPID as String] as? Int32) == entry.app.processIdentifier }.compactMap { $0[kCGWindowNumber as String] as? Int })
+            }
+            let before = windows()
+            // Menu-tracking callbacks can block AXPress until timeout even after the
+            // menu opens. A timeout must NEVER trigger a second press or steal focus.
+            AXUIElementSetMessagingTimeout(entry.element, 0.25)
+            AXUIElementSetMessagingTimeout(entry.sourceElement, 0.15)
+            let result = AXUIElementPerformAction(entry.element, kAXPressAction as CFString)
+            var observed = false
+            for _ in 0..<12 {
+                if visibleMenu(entry.sourceElement) || !windows().subtracting(before).isEmpty { observed = true; break }
+                Thread.sleep(forTimeInterval: 0.04)
+            }
+            if ProcessInfo.processInfo.environment["MENU_GRID_DIAGNOSTICS"] == "1" {
+                FileHandle.standardError.write(Data("MenuGrid action result=\(result.rawValue) observed=\(observed)\n".utf8))
+            }
+            if observed || result == .success { return }
+            // Only an explicit unsupported-action response permits another action.
+            // CannotComplete is ambiguous: leave the target's menu undisturbed.
+            if result == .actionUnsupported {
+                let fallback = AXUIElementPerformAction(entry.element, kAXShowMenuAction as CFString)
+                if fallback == .success || fallback == .cannotComplete { return }
+            }
+            DispatchQueue.main.async {
+                self.message = result == .cannotComplete
+                    ? "未能确认 \(entry.name) 的菜单是否打开，请重试。"
+                    : "\(entry.name) 打开失败，请刷新后重试（\(result.rawValue)）"
+                // Display this only on the next user-initiated opening. Bringing
+                // our panel forward here would dismiss a slow native menu.
             }
         }
     }
